@@ -41,14 +41,18 @@ def boat_ode(t, state, T, alpha, tau_env):
         [0, -Y_v, 0],
         [0, 0, -N_r]
     ])
-    
-    nu_dot = np.dot(M_inv, tau_silnika + tau_env - np.dot(C, nu) - np.dot(D, nu))
-    
     J = np.array([
         [np.cos(psi), -np.sin(psi), 0],
         [np.sin(psi),  np.cos(psi), 0],
         [0,            0,           1]
     ])
+
+    tau_env_loc = np.dot(J.T,tau_env)
+
+
+    nu_dot = np.dot(M_inv, tau_silnika + tau_env_loc - np.dot(C, nu) - np.dot(D, nu))
+    
+    
     eta_dot = np.dot(J, nu)
     
     return np.concatenate((eta_dot, nu_dot))
@@ -72,21 +76,11 @@ for i in range(len(time_steps)):
     states_sim[i, :] = current_state
     
     # --- ZADAWANIE WEJŚĆ  ---
-    if t < 5.0:
+    if t<5:
         T_cmd = 0.0
         alpha_cmd = 0.0
-    elif 5.0 <= t < 10.0:
-        
-        T_cmd = 150.0
-        alpha_cmd = np.radians(-15.0) 
-    elif 10.0 <= t < 15.0:
-        
-        T_cmd = 0.0
-        alpha_cmd = 0.0
-    else:
-        
-        T_cmd = 150.0
-        alpha_cmd = 0.0
+    elif 5 <= t <10:
+        T_cmd = 100.0
         
     T = np.clip(T_cmd, 0.0, 200.0)
     alpha = np.clip(alpha_cmd, np.radians(-45), np.radians(45))
@@ -95,7 +89,7 @@ for i in range(len(time_steps)):
     T_hist[i] = T
     alpha_hist[i] = alpha
     
-    tau_env = np.array([0, 0, 0])
+    tau_env = np.array([-5, 0, 0])
     
     sol = solve_ivp(
         fun=boat_ode,
