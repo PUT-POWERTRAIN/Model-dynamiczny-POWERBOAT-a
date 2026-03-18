@@ -12,7 +12,7 @@ class SimpleMPC:
         self.Np = 25   # Horyzont przewidywania (dawne N)
         self.Nc = 3    # Horyzont sterowania (NOWOŚĆ)
         self.dt = 1
-        self.target = np.array([10.0, 3.0, 0.0, 0.0, 0.0, 0.0])
+        self.target = np.array([0.0, 5.0, 0.0, 0.0, 0.0, 0.0])
         self.t = 0
         
         # ZMIANA: Granice tylko dla ilości kroków sterowania (Nc)
@@ -97,7 +97,7 @@ class SimpleMPC:
             dist_sq = dx**2 + dy**2
 
             # A) Błąd odległości (im bliżej celu, tym mniejszy koszt)
-            error_cost += Q_pos * dist_sq
+            error_cost += Q_pos * np.sqrt(dist_sq)
 
             # B) Płynny błąd kursu (Line-of-Sight)
             # Funkcja (1 - cos) tworzy gładką "miskę" dla optymalizatora, bez ostrych skoków
