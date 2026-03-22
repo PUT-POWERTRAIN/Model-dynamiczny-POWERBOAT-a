@@ -1,218 +1,195 @@
+import casadi as ca
 import numpy as np
-from scipy.optimize import minimize
-from scipy.interpolate import CubicSpline
 import casadi_model as boat_model
 
-
-class SimpleMPC:
+class PathFollowingMPC:
     def __init__(self):
-        self.Np = 14
-        self.Nc = 3
-        self.dt = 0.928
-        self.t  = 0.0
-        self.target = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        self.Np = 25  
+        self.dt = boat_model.DT  
 
-        self.Q_pos    = 10.0
-        self.Q_psi    = 1.0
-        self.R_dV     = 5.0
-        self.R_dAlpha = 30.25 * self.Np
+        # --- WAGI DO TUNINGU ---
+        self.Q_contour = 250.0   
+        self.Q_vtheta  = 10.0    
+        self.v_ref     = 5.25    # PODNIESIONE: max prędkość łodzi (~5.25 m/s przy 24V)
+        self.R_dV      = 5.0     
+        self.R_dAlpha  = 50.0    
+        
+        # NOWA WAGA: zmusza łódź fizyczną do posłuszeństwa (przydaje się do twardego hamowania)
+        self.Q_speed   = 20.0    
 
-        self.bounds = [(0, 24), (-45, 45)] * self.Nc
-        self.u_prev         = None
-        self.predicted_path = None
+        self.path_s = None
+        self.spline_x = None
+        self.spline_y = None
+        self.s_max = 0.0
 
-        # ── PATH FOLLOWING ──────────────────────────────────────────────
-        self.path_points   = None
-        self.path_spline_x = None
-        self.path_spline_y = None
-        self.path_s        = None
-        self.s_current     = 0.0
-        self.goal_tolerance = 1.0
-
-        # ── ADAPTACYJNY LOOKAHEAD ───────────────────────────────────────
-        self.lookahead_min = 4.0    # [m] — ostry zakręt
-        self.lookahead_max = 20.0   # [m] — prosta
-        self.lookahead     = self.lookahead_max  # aktualny lookahead
-        # Kąt przy wierzchołku środkowego punktu trójkąta:
-        # ~180° = prosta → lookahead_max
-        # ~90°  = zakręt → lookahead_max * 0.5
-        # <60°  = ostry  → lookahead_min
-        self._lookahead_angle = np.pi  # [rad] — zapamiętany dla UI
-
-    # ── ŚCIEŻKA ─────────────────────────────────────────────────────────
+        self.last_sol_U = None
+        self.last_sol_X = None
+        self.last_theta_0 = 0.0
 
     def set_path(self, waypoints: np.ndarray):
-        self.path_points = waypoints
         diffs = np.diff(waypoints, axis=0)
         seg_lengths = np.hypot(diffs[:, 0], diffs[:, 1])
-        self.path_s = np.concatenate([[0.0], np.cumsum(seg_lengths)])
-        self.path_spline_x = CubicSpline(self.path_s, waypoints[:, 0])
-        self.path_spline_y = CubicSpline(self.path_s, waypoints[:, 1])
-        self.s_current = 0.0
-        self.lookahead = self.lookahead_max
+        orig_s = np.concatenate([[0.0], np.cumsum(seg_lengths)])
 
-    def is_path_complete(self):
-        if self.path_s is None:
-            return False
-        return (self.path_s[-1] - self.s_current) < self.goal_tolerance
+        s_dense = np.linspace(0, orig_s[-1], 100)
+        x_dense = np.interp(s_dense, orig_s, waypoints[:, 0])
+        y_dense = np.interp(s_dense, orig_s, waypoints[:, 1])
 
-    # ── ADAPTACYJNY LOOKAHEAD ───────────────────────────────────────────
+        self.path_s = s_dense
+        self.s_max = self.path_s[-1]
 
-    def _compute_adaptive_lookahead(self):
-        """
-        Trzy punkty na ścieżce tworzą trójkąt:
-          A = s_current + lookahead_min        (blisko)
-          B = s_current + (min+max)/2          (środek)
-          C = s_current + lookahead_max        (daleko)
+        self.spline_x = ca.interpolant('x_spline', 'bspline', [self.path_s], x_dense)
+        self.spline_y = ca.interpolant('y_spline', 'bspline', [self.path_s], y_dense)
 
-        Kąt w wierzchołku B (środkowym):
-          ~π (180°) = prosta    → lookahead_max
-          ~π/2 (90°) = zakręt   → interpolacja
-          <π/3 (60°) = ostry    → lookahead_min
+        self._build_opti()
+        
+        self.last_theta_0 = 0.0  
+        self.last_sol_U = None
+        self.last_sol_X = None
 
-        Lookahead interpolowany liniowo między min a max
-        proporcjonalnie do kąta: lookahead = min + (max-min)*(angle/π)
-        """
-        s_max = self.path_s[-1]
+    def _build_opti(self):
+        self.opti = ca.Opti()
 
-        sA = min(self.s_current + self.lookahead_min,           s_max)
-        sB = min(self.s_current + (self.lookahead_min +
-                                   self.lookahead_max) / 2.0,  s_max)
-        sC = min(self.s_current + self.lookahead_max,           s_max)
+        self.nx = 9
+        self.X = self.opti.variable(self.nx, self.Np + 1)
+        self.nu = 3
+        self.U = self.opti.variable(self.nu, self.Np)
 
-        A = np.array([self.path_spline_x(sA), self.path_spline_y(sA)])
-        B = np.array([self.path_spline_x(sB), self.path_spline_y(sB)])
-        C = np.array([self.path_spline_x(sC), self.path_spline_y(sC)])
+        self.x0_param = self.opti.parameter(self.nx)
+        self.opti.subject_to(self.X[:, 0] == self.x0_param)
 
-        # Wektory BA i BC (od środkowego punktu do pozostałych)
-        BA = A - B
-        BC = C - B
+        self.opti.subject_to(self.opti.bounded(0, self.U[0, :], 24))             
+        self.opti.subject_to(self.opti.bounded(-np.pi/4, self.U[1, :], np.pi/4)) 
+        self.opti.subject_to(self.opti.bounded(0.0, self.U[2, :], 6.0))          
 
-        len_BA = np.linalg.norm(BA)
-        len_BC = np.linalg.norm(BC)
+        cost = 0
 
-        if len_BA < 1e-6 or len_BC < 1e-6:
-            # Jesteśmy blisko końca — użyj min
-            angle = self.lookahead_min / self.lookahead_max * np.pi
-        else:
-            cos_angle = np.dot(BA, BC) / (len_BA * len_BC)
-            cos_angle = np.clip(cos_angle, -1.0, 1.0)
-            angle = np.arccos(cos_angle)  # 0..π
+        for k in range(self.Np):
+            x_k     = self.X[0:6, k]
+            u_k     = self.X[3, k]  # Fizyczna prędkość wzdłużna łodzi
+            w_k     = self.X[6, k]
+            alp_k   = self.X[7, k]
+            theta_k = self.X[8, k]
 
-        self._lookahead_angle = angle
-        self._triangle_points = (A, B, C)  # do rysowania w UI
+            V_k       = self.U[0, k]
+            acmd_k    = self.U[1, k]
+            v_theta_k = self.U[2, k]
 
-        # Interpolacja liniowa: angle=π → max, angle=0 → min
-        t = angle / np.pi
-        lookahead = self.lookahead_min + (self.lookahead_max -
-                                          self.lookahead_min) * t
-        return float(np.clip(lookahead, self.lookahead_min,
-                              self.lookahead_max))
+            alp_next = boat_model.servo_step(alp_k, acmd_k)
+            w_next   = boat_model.motor_step(w_k, V_k)
+            T_k      = boat_model.c_T * w_k * ca.fabs(w_k) 
+            x_next   = boat_model.boat_step(x_k, T_k, alp_k)
+            
+            theta_next = theta_k + self.dt * v_theta_k
 
-    # ── WIRTUALNY CEL ────────────────────────────────────────────────────
+            self.opti.subject_to(self.X[0:6, k+1] == x_next)
+            self.opti.subject_to(self.X[6, k+1]   == w_next)
+            self.opti.subject_to(self.X[7, k+1]   == alp_next)
+            self.opti.subject_to(self.X[8, k+1]   == theta_next)
 
-    def _update_virtual_target(self, x_current):
-        if self.path_spline_x is None:
-            raise RuntimeError("Wywołaj set_path() najpierw.")
+            self.opti.subject_to(theta_next <= self.s_max + 5.0)
 
-        boat_x, boat_y = float(x_current[0]), float(x_current[1])
-        s_max = self.path_s[-1]
+            # === INTELIGENTNE HAMOWANIE ===
+            # 1. Odległość do końca trasy
+            dist_to_end = ca.fmax(self.s_max - theta_k, 0.0)
 
-        # Szukaj rzutu — tylko do przodu (zapobiega cofaniu)
-        s_search = np.linspace(
-            self.s_current,
-            min(self.s_current + 30.0, s_max),
-            300
-        )
-        path_x = self.path_spline_x(s_search)
-        path_y = self.path_spline_y(s_search)
-        dists  = np.hypot(path_x - boat_x, path_y - boat_y)
-        idx_min = int(np.argmin(dists))
-        self.s_current = max(self.s_current, s_search[idx_min])
+            # 2. Prędkości docelowe: 
+            # Wirtualny cel zwalnia, ale nie do zera (żeby minął metę) - np. min 0.2 m/s
+            v_target_virtual = ca.fmin(self.v_ref, ca.fmax(0.2, 0.4 * dist_to_end))
+            
+            # FIZYCZNA łódź ma docelowo wyhamować do zera (w punkt!)
+            v_target_physical = ca.fmin(self.v_ref, 0.4 * dist_to_end)
 
-        # Adaptacyjny lookahead na podstawie krzywizny
-        self.lookahead = self._compute_adaptive_lookahead()
+            # 3. Path following bazujące na naturalnej dynamice theta_k
+            safe_theta = ca.fmin(ca.fmax(theta_k, 0.0), self.s_max)
+            path_x = self.spline_x(safe_theta)
+            path_y = self.spline_y(safe_theta)
 
-        # Punkt celu z wyprzedzeniem
-        s_target  = min(self.s_current + self.lookahead, s_max)
-        target_x  = float(self.path_spline_x(s_target))
-        target_y  = float(self.path_spline_y(s_target))
+            err_x = self.X[0, k] - path_x
+            err_y = self.X[1, k] - path_y
 
-        dx_ds = float(self.path_spline_x(s_target, 1))
-        dy_ds = float(self.path_spline_y(s_target, 1))
-        psi_path = np.arctan2(dy_ds, dx_ds)
+            # 4. Kary
+            cost += self.Q_contour * (err_x**2 + err_y**2)
+            cost += self.Q_vtheta * (v_theta_k - v_target_virtual)**2 
+            
+            # Wymuszamy, by łódź hamowała tak jak wskazuje funkcja (0.4 * dist)
+            cost += self.Q_speed * (u_k - v_target_physical)**2
 
-        self.target = np.array([target_x, target_y, psi_path,
-                                 0.0, 0.0, 0.0])
-        return float(dists[idx_min])
+            if k > 0:
+                dV     = self.U[0, k] - self.U[0, k-1]
+                dAlpha = self.U[1, k] - self.U[1, k-1]
+                cost  += self.R_dV * dV**2 + self.R_dAlpha * dAlpha**2
 
-    # ── MODEL (RK4 przez CasADi) ─────────────────────────────────────────
+        self.opti.minimize(cost)
 
-    def _rollout(self, u_opt, x0, alpha0, w0):
-        Np, Nc = self.Np, self.Nc
-        u_seq = np.zeros(2 * Np)
-        u_seq[:2*Nc]     = u_opt
-        u_seq[2*Nc::2]   = u_opt[-2]
-        u_seq[2*Nc+1::2] = u_opt[-1]
+        p_opts = {"expand": True, "print_time": False}
+        s_opts = {"max_iter": 100, "print_level": 0, "sb": "yes", "acceptable_tol": 1e-2}
+        self.opti.solver('ipopt', p_opts, s_opts)
 
-        states = [np.asarray(x0).flatten()]
-        alpha  = float(alpha0)
-        w      = float(w0)
+    def _find_closest_theta(self, boat_x, boat_y, current_s):
+        lookbehind = 10.0
+        lookahead = 20.0
+        s_min = max(0.0, current_s - lookbehind)
+        s_max = min(self.s_max, current_s + lookahead)
 
-        for i in range(Np):
-            V    = float(u_seq[2*i])
-            acmd = float(np.radians(u_seq[2*i+1]))
-            alpha = float(boat_model.servo_step(alpha, acmd))
-            w     = float(boat_model.motor_step(w, V))
-            T     = boat_model.c_T * w * abs(w)
-            x_next = np.asarray(
-                boat_model.boat_step(states[-1], T, alpha)).flatten()
-            states.append(x_next)
-
-        return np.array(states)
-
-    # ── FUNKCJA KOSZTU ───────────────────────────────────────────────────
-
-    def cost_function(self, u_opt, x_current, current_alpha, current_w):
-        states = self._rollout(u_opt, x_current, current_alpha, current_w)
-
-        cost = 0.0
-        tx, ty    = self.target[0], self.target[1]
-        psi_path  = self.target[2]
-
-        for i in range(1, self.Np + 1):
-            x, y, psi = states[i][0], states[i][1], states[i][2]
-            dx = tx - x;  dy = ty - y
-            cost += self.Q_pos * np.sqrt(dx**2 + dy**2)
-            cost += self.Q_psi * (1.0 - np.cos(psi - psi_path))
-
-        for i in range(1, self.Nc):
-            dV   = u_opt[2*i]   - u_opt[2*(i-1)]
-            dalp = u_opt[2*i+1] - u_opt[2*(i-1)+1]
-            cost += self.R_dV * dV**2 + self.R_dAlpha * dalp**2
-
-        return cost
-
-    # ── STEROWANIE ───────────────────────────────────────────────────────
+        s_search = np.linspace(s_min, s_max, 100)
+        path_x = self.spline_x(s_search).full().flatten()
+        path_y = self.spline_y(s_search).full().flatten()
+        dists = np.hypot(path_x - boat_x, path_y - boat_y)
+        return float(s_search[np.argmin(dists)])
 
     def compute_control(self, x_current, current_alpha, current_w):
-        if self.u_prev is None:
-            u_init = np.zeros(2 * self.Nc)
-            u_init[0::2] = 12.0
+        if self.spline_x is None:
+            raise RuntimeError("Najpierw wywołaj set_path(waypoints)!")
+
+        boat_x, boat_y = x_current[0], x_current[1]
+        theta_guess = 0.0 if self.last_sol_X is None else self.last_sol_X[8, 1]
+
+        theta_0 = self._find_closest_theta(boat_x, boat_y, theta_guess)
+
+        if self.last_theta_0 - theta_0 > 5.0:
+            pass
         else:
-            u_init = np.roll(self.u_prev, -2)
-            u_init[-2] = self.u_prev[-2]
-            u_init[-1] = self.u_prev[-1]
+            theta_0 = max(theta_0, self.last_theta_0)
+        self.last_theta_0 = theta_0
 
-        res = minimize(
-            self.cost_function, u_init,
-            args=(x_current, current_alpha, current_w),
-            method='SLSQP',
-            bounds=self.bounds,
-            options={'maxiter': 50, 'ftol': 1e-4}
-        )
+        x0_full = np.concatenate([x_current, [current_w, current_alpha, theta_0]])
+        self.opti.set_value(self.x0_param, x0_full)
 
-        self.predicted_path = self._rollout(
-            res.x, x_current, current_alpha, current_w)
-        self.u_prev = res.x
-        return float(res.x[0]), float(res.x[1])
+        if self.last_sol_U is not None:
+            U_init = np.roll(self.last_sol_U, -1, axis=1)
+            U_init[:, -1] = U_init[:, -2]
+            self.opti.set_initial(self.U, U_init)
+            
+            X_init = np.roll(self.last_sol_X, -1, axis=1)
+            X_init[:, -1] = X_init[:, -2]
+            self.opti.set_initial(self.X, X_init)
+
+        try:
+            sol = self.opti.solve()
+            U_sol = sol.value(self.U)
+            X_sol = sol.value(self.X)
+            
+            self.last_sol_U = U_sol
+            self.last_sol_X = X_sol
+            
+        except Exception as e:
+            print("[NMPC] Solver złapał zadyszkę na zakręcie! Przesuwam stare sterowanie.")
+            if self.last_sol_U is not None:
+                U_sol = np.roll(self.last_sol_U, -1, axis=1)
+                U_sol[:, -1] = U_sol[:, -2]  
+                X_sol = np.roll(self.last_sol_X, -1, axis=1)
+                X_sol[:, -1] = X_sol[:, -2]
+                
+                self.last_sol_U = U_sol
+                self.last_sol_X = X_sol
+            else:
+                U_sol = np.zeros((self.nu, self.Np))
+                X_sol = np.zeros((self.nx, self.Np+1))
+
+        self.predicted_path = X_sol[0:2, :].T
+
+        V_cmd = float(U_sol[0, 0])
+        alpha_cmd_deg = float(np.degrees(U_sol[1, 0]))
+
+        return V_cmd, alpha_cmd_deg

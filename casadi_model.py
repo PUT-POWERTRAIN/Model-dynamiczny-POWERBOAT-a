@@ -19,7 +19,7 @@ k_walk=0.01; J_m=0.2; R_m=0.5; k_t=0.1; k_e=0.1; b_m=0.01
 c_Q=0.0005; c_T=0.05
 T_servo=3.0; max_rate=float(np.radians(60.0))
 
-DT = 1.0  # krok czasowy [s] — wbudowany w steppery
+DT = 0.2  # krok czasowy [s] — wbudowany w steppery (zmniejszone dla stabilności)
 
 # ==========================================
 # ODE
