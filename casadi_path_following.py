@@ -329,9 +329,16 @@ def simulation_step(state):
     """Jeden krok symulacji z nowym MPC bazującym na stanie wirtualnym."""
     mpc = state.mpc
 
-    # 1. Sprawdź, czy dotarliśmy do końca ścieżki
+    # 1. Sprawdź, czy dotarliśmy do końca ścieżki I czy łódź wyhamowała
     current_theta = mpc.last_sol_X[8, 1] if mpc.last_sol_X is not None else 0.0
-    if mpc.s_max > 0 and (mpc.s_max - current_theta) < 1.0:
+    speed = float(np.hypot(state.x[3], state.x[4]))
+    if mpc.s_max > 0 and (mpc.s_max - current_theta) < 1.0 and speed < 0.3:
+        state.path_done = True
+        return
+
+    # Timeout safety — max 500 kroków
+    if state.step > 500:
+        print(f"[SIM] Timeout! step={state.step}, speed={speed:.2f}")
         state.path_done = True
         return
 
