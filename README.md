@@ -20,7 +20,7 @@ Plik casadi_model.py zawiera implementację dynamiki modelu zaimplementowaną za
 
 Plik casadi_mpc.py zawiera implementację sterowania predykcyjnego.
 
-Plik casadi_path_folowing.py zawiera symulację path following na podstawie MPC.
+Plik casadi_path_following.py zawiera symulację path following na podstawie MPC.
 
 ```
 python ./casadi_path_following.py
