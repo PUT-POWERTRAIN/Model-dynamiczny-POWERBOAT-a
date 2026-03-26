@@ -139,7 +139,7 @@ for i in range(len(time_steps)):
     
     V_hist[i] = V_in
     alpha_hist[i] = alpha_actual
-    tau_env = np.array([0, 0, 0])
+    tau_env = np.array([-5, 0, 0])
     
     # 1. SOLVER SERWA
     sol_servo = solve_ivp(
@@ -176,3 +176,100 @@ for i in range(len(time_steps)):
         max_step=dt
     )
     current_state = sol_boat.y[:, -1]
+
+# ==========================================
+# 4. WIZUALIZACJA I ANIMACJA 
+# ==========================================
+print("Startuję animację... (Zostaw okno otwarte)")
+
+x_hist = states_sim[:, 0]
+y_hist = states_sim[:, 1]
+psi_hist = states_sim[:, 2]
+u_hist = states_sim[:, 3]
+v_hist = states_sim[:, 4]  
+
+fig = plt.figure(figsize=(16, 9))
+gs = gridspec.GridSpec(5, 2, width_ratios=[1, 1.5]) # <--- ZMIANA: 5 wierszy!
+
+# 1. Wykres wzdłużnej (u)
+ax_u = fig.add_subplot(gs[0, 0])
+ax_u.plot(time_steps, u_hist, 'b-', lw=2)
+ax_u.set_ylabel('u [m/s]\n(Wzdłużna)')
+ax_u.grid(True)
+
+# 2. Wykres poprzecznej (v) - POWRACA!
+ax_v = fig.add_subplot(gs[1, 0], sharex=ax_u)
+ax_v.plot(time_steps, v_hist, 'r-', lw=2) 
+ax_v.set_ylabel('v [m/s]\n(Poprzeczna)')
+ax_v.grid(True)
+
+# 3. Wykres Napięcia (V)
+ax_V = fig.add_subplot(gs[2, 0], sharex=ax_u)
+ax_V.plot(time_steps, V_hist, 'r-', lw=2, color='orange') 
+ax_V.set_ylabel('Napięcie\nWej. [V]')
+ax_V.grid(True)
+
+# 4. Wykres Ciągu (T)
+ax_T = fig.add_subplot(gs[3, 0], sharex=ax_u)
+ax_T.plot(time_steps, T_hist, 'g-', lw=2)
+ax_T.set_ylabel('Ciąg T [N]')
+ax_T.grid(True)
+
+# 5. Wykres Kąta Steru (alpha)
+ax_alpha = fig.add_subplot(gs[4, 0], sharex=ax_u)
+ax_alpha.plot(time_steps, np.degrees(alpha_hist), 'm-', lw=2) 
+ax_alpha.set_ylabel('Kąt α [°]')
+ax_alpha.set_xlabel('Czas symulacji [s]')
+ax_alpha.grid(True)
+
+# Pionowe linie skanera
+line_u = ax_u.axvline(x=0, color='k', linestyle='--', alpha=0.7)
+line_v = ax_v.axvline(x=0, color='k', linestyle='--', alpha=0.7)
+line_V = ax_V.axvline(x=0, color='k', linestyle='--', alpha=0.7)
+line_T = ax_T.axvline(x=0, color='k', linestyle='--', alpha=0.7)
+line_alpha = ax_alpha.axvline(x=0, color='k', linestyle='--', alpha=0.7)
+
+# --- MAPA (Rozciągnięta na całą prawą kolumnę) ---
+ax_map = fig.add_subplot(gs[:, 1]) 
+ax_map.set_xlabel('Oś Y (Wschód) [m]')
+ax_map.set_ylabel('Oś X (Północ) [m]')
+ax_map.set_aspect('equal') 
+ax_map.grid(True, linestyle='--', alpha=0.7)
+
+margin = 5.0
+ax_map.set_xlim(np.min(y_hist) - margin, np.max(y_hist) + margin)
+ax_map.set_ylim(np.min(x_hist) - margin, np.max(x_hist) + margin)
+
+line_traj, = ax_map.plot([], [], 'b-', linewidth=2, label='Ślad (Trajektoria)')
+boat_shape, = ax_map.plot([], [], 'r-', linewidth=3, label='Dziób ')
+ax_map.legend()
+
+L = 4.0  
+W = 2.0  
+boat_local = np.array([[L/2, 0], [-L/2, -W/2], [-L/2, W/2], [L/2, 0]])
+
+fig.tight_layout()
+
+for i in range(0, len(time_steps), 2):
+    t_current = time_steps[i]
+    
+    line_u.set_xdata([t_current, t_current])
+    line_v.set_xdata([t_current, t_current])
+    line_V.set_xdata([t_current, t_current])
+    line_T.set_xdata([t_current, t_current])
+    line_alpha.set_xdata([t_current, t_current])
+    
+    line_traj.set_data(y_hist[:i], x_hist[:i])
+    
+    x_i = x_hist[i]
+    y_i = y_hist[i]
+    psi_i = psi_hist[i]
+    
+    ax_map.set_title(f'Animacja Trajektorii USV 4m (Czas: {t_current:.1f} s)')
+    
+    rotated_x = x_i + boat_local[:, 0] * np.cos(psi_i) - boat_local[:, 1] * np.sin(psi_i)
+    rotated_y = y_i + boat_local[:, 0] * np.sin(psi_i) + boat_local[:, 1] * np.cos(psi_i)
+    boat_shape.set_data(rotated_y, rotated_x)
+    plt.pause(0.01)
+
+plt.show()
