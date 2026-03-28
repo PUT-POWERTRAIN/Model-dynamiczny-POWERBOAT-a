@@ -1,11 +1,13 @@
 import casadi as ca
 import numpy as np
 import casadi_model as boat_model
+from EKF import EKF
 
 class PathFollowingMPC:
     def __init__(self):
         self.Np = 25  
         self.dt = boat_model.DT  
+        self.ekf = EKF() # Filtr Kalmana
 
         # --- WAGI DO TUNINGU (Ego-Frame wg MDPI Sensors) ---
         self.Q_lat     = 1500.0  # Bardzo silny nacisk na trzymanie się ścieżki
@@ -77,6 +79,7 @@ class PathFollowingMPC:
 
         self.x0_param = self.opti.parameter(self.nx)
         self.opti.subject_to(self.X[:, 0] == self.x0_param)
+        self.d_param = self.opti.parameter(6)  # parametr dla EKF biasu
 
         self.opti.subject_to(self.opti.bounded(0, self.U[0, :], 24))             
         self.opti.subject_to(self.opti.bounded(-np.pi/4, self.U[1, :], np.pi/4)) 
@@ -106,7 +109,7 @@ class PathFollowingMPC:
             alp_next = boat_model.servo_step(alp_k, acmd_k)
             w_next   = boat_model.motor_step(w_k, V_k)
             T_k      = boat_model.c_T * w_k * ca.fabs(w_k) 
-            x_next   = boat_model.boat_step(x_k, T_k, alp_k)
+            x_next   = boat_model.boat_step(x_k, T_k, alp_k) + self.d_param
             theta_next = theta_k + self.dt * v_theta_k
 
             self.opti.subject_to(self.X[0:6, k+1] == x_next)
@@ -219,7 +222,21 @@ class PathFollowingMPC:
         if self.spline_x is None:
             raise RuntimeError("Najpierw wywołaj set_path(waypoints)!")
 
-        boat_x, boat_y = x_current[0], x_current[1]
+        # KOREKCJA EKF na podstawie pomiaru z symulatora
+        y_meas = np.array([x_current[0], x_current[1], x_current[2], x_current[5]]).reshape(4, 1)
+        if np.all(self.ekf.x_hat == 0): # Inicjalizacja przy pierwszym kroku
+            self.ekf.x_hat = np.array(x_current).reshape(6, 1)
+            self.ekf.w_hat = current_w
+            self.ekf.alpha_hat = current_alpha
+            
+        self.ekf.update(y_meas)
+        
+        # Pobranie wyestymowanych stanu i biasu z EKF
+        x_hat = self.ekf.x_hat.flatten()
+        d_est = self.ekf.d.flatten()
+
+        # Przekazanie wyestymowanego x i y dla funkcji szukającej thety w ścieżce
+        boat_x, boat_y = x_hat[0], x_hat[1]
         theta_guess = 0.0 if self.last_sol_X is None else self.last_sol_X[8, 1]
 
         theta_0 = self._find_closest_theta(boat_x, boat_y, theta_guess)
@@ -230,8 +247,9 @@ class PathFollowingMPC:
             theta_0 = max(theta_0, self.last_theta_0)
         self.last_theta_0 = theta_0
 
-        x0_full = np.concatenate([x_current, [current_w, current_alpha, theta_0]])
+        x0_full = np.concatenate([x_hat, [current_w, current_alpha, theta_0]])
         self.opti.set_value(self.x0_param, x0_full)
+        self.opti.set_value(self.d_param, d_est)
 
         if self.last_sol_U is not None:
             U_init = np.roll(self.last_sol_U, -1, axis=1)
@@ -262,10 +280,10 @@ class PathFollowingMPC:
             total = c1_lat + c1_lon + c2 + c3 + c4 + c5 + c6 + c7
             theta_now = float(X_sol[8, 0])
             dist_end = max(self.s_max_original - theta_now, 0.0)
-            print(f"[COST] dist={dist_end:5.1f}m | "
-                  f"lat={c1_lat:7.1f} lon={c1_lon:7.1f} vth={c2:6.1f} spd={c3:5.1f} "
-                  f"hdg={c4:6.1f} sway={c7:5.1f} dV={c5:4.1f} dA={c6:5.1f} | "
-                  f"TOT={total:7.1f}")
+            #print(f"[COST] dist={dist_end:5.1f}m | "
+            #      f"lat={c1_lat:7.1f} lon={c1_lon:7.1f} vth={c2:6.1f} spd={c3:5.1f} "
+            #      f"hdg={c4:6.1f} sway={c7:5.1f} dV={c5:4.1f} dA={c6:5.1f} | "
+            #      f"TOT={total:7.1f}")
             
         except Exception as e:
             full_msg = str(e)
@@ -291,5 +309,8 @@ class PathFollowingMPC:
 
         V_cmd = float(U_sol[0, 0])
         alpha_cmd_deg = float(np.degrees(U_sol[1, 0]))
+
+        # PREDYKCJA EKF na kolejny krok
+        self.ekf.predict([V_cmd, float(U_sol[1, 0])])
 
         return V_cmd, alpha_cmd_deg

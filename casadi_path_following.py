@@ -22,7 +22,8 @@ import pygame
 sys.path.insert(0, ".")
 # Zmiana: importujemy nową klasę PathFollowingMPC
 from casadi_mpc import PathFollowingMPC as MPC
-import casadi_model as boat_model
+import casadi_model_zaklocenia as boat_model
+#import casadi_model as boat_model
 
 # ==================== KONFIGURACJA ====================
 SCREEN_W, SCREEN_H = 1280, 800
@@ -341,8 +342,7 @@ def simulation_step(state):
         print(f"[SIM] Timeout! step={state.step}, speed={speed:.2f}")
         state.path_done = True
         return
-
-    # 2. Oblicz optymalne sterowanie NMPC
+    
     try:
         V_cmd, alpha_cmd_deg = mpc.compute_control(state.x, state.alpha, state.w)
     except Exception as e:
