@@ -101,7 +101,20 @@ class SimState:
         self.step = 0
 
         # Ścieżka
-        self.waypoints = []
+        self.waypoints = [
+            (62.28, 25.59), (65.81, 22.06), (70.00, 19.85), (76.18, 18.53),
+            (82.79, 18.53), (88.75, 18.97), (94.26, 20.51), (100.00, 22.06),
+            (103.97, 23.60), (110.59, 26.69), (117.21, 30.22), (122.50, 34.85),
+            (127.35, 39.93), (131.54, 46.10), (133.75, 52.72), (135.29, 60.66),
+            (136.62, 68.38), (136.84, 75.88), (136.84, 82.72), (135.96, 90.00),
+            (133.97, 97.50), (131.32, 102.13), (127.13, 107.87), (121.62, 113.16),
+            (116.10, 116.69), (108.60, 120.44), (101.54, 123.75), (93.07, 128.47),
+            (82.07, 130.61), (72.90, 130.91), (63.12, 129.38), (56.09, 126.33),
+            (51.20, 120.21), (48.45, 112.88), (47.23, 106.77), (48.45, 99.43),
+            (51.51, 93.62), (57.62, 88.43), (64.34, 86.29), (75.04, 86.29),
+            (83.29, 91.48), (90.63, 93.32), (97.96, 89.34), (100.10, 84.15),
+            (98.88, 77.12), (95.21, 69.48), (90.32, 61.84), (86.66, 56.03)
+        ]
         self.path_ready = False
         self.path_done = False
 
@@ -338,7 +351,7 @@ def simulation_step(state):
         return
 
     # Timeout safety — max 500 kroków
-    if state.step > 500:
+    if state.step > 1500:
         print(f"[SIM] Timeout! step={state.step}, speed={speed:.2f}")
         state.path_done = True
         return
@@ -442,6 +455,9 @@ def main():
 
                         print(f"[SIM] Ścieżka zainicjalizowana. "
                               f"Długość = {state.mpc.s_max:.1f} m")
+                        print("[SIM] Waypoints:")
+                        for i, (wx, wy) in enumerate(state.waypoints):
+                            print(f"  {i}: x={wx:.2f}, y={wy:.2f}")
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:  # LPM
