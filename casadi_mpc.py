@@ -4,18 +4,19 @@ import casadi_model as boat_model
 from EKF import EKF
 
 class PathFollowingMPC:
-    def __init__(self):
+    def __init__(self, use_ekf=False):
         self.Np = 75  
         self.dt = boat_model.DT  
+        self.use_ekf = use_ekf
         self.ekf = EKF()
 
-        self.Q_lat     = 1500.0  
-        self.Q_lon     = 20.0    
-        self.Q_vtheta  = 10.0    
+        self.Q_lat     = 100.0  
+        self.Q_lon     = 100.0    
+        self.Q_vtheta  = 100.0    
         self.v_ref     = 2.00    
         self.R_dV      = 5.0     
-        self.R_dAlpha  = 100.0    
-        self.Q_speed   = 5.0     
+        self.R_dAlpha  = 100.0   
+        self.Q_speed   = 25.0     
         
         self.ghost_extension = 20.0
         self.path_s = None
@@ -28,6 +29,13 @@ class PathFollowingMPC:
         self.last_sol_U = None
         self.last_sol_X = None
         self.last_theta_0 = 0.0
+
+        self.c_lat_hist = []
+        self.c_lon_hist = []
+        self.c_vtheta_hist = []
+        self.c_speed_hist = []
+        self.c_dv_hist = []
+        self.c_dalpha_hist = []
 
     def set_path(self, waypoints: np.ndarray):
         dir_vec = waypoints[-1] - waypoints[-2]
@@ -165,19 +173,23 @@ class PathFollowingMPC:
         if self.spline_x is None:
             raise RuntimeError("Najpierw wywołaj set_path(waypoints)!")
 
-        y_meas = np.array([x_current[0], x_current[1], x_current[2], x_current[5]]).reshape(4, 1)
-        
-        if not self.ekf._initialized: 
-            self.ekf.x_hat = np.array(x_current).reshape(6, 1)
-            self.ekf.w_hat = current_w
-            self.ekf.alpha_hat = current_alpha
-            self.ekf._initialized = True
+        if self.use_ekf:
+            y_meas = np.array([x_current[0], x_current[1], x_current[2], x_current[5]]).reshape(4, 1)
             
-        self.ekf.update(y_meas)
-        
-        # 1. Pobranie PRAWDZIWEGO stanu i biasu z EKF
-        x_true = self.ekf.x_hat.flatten()
-        d_est = self.ekf.d.flatten()
+            if not self.ekf._initialized: 
+                self.ekf.x_hat = np.array(x_current).reshape(6, 1)
+                self.ekf.w_hat = current_w
+                self.ekf.alpha_hat = current_alpha
+                self.ekf._initialized = True
+                
+            self.ekf.update(y_meas)
+            
+            # 1. Pobranie PRAWDZIWEGO stanu i biasu z EKF
+            x_true = self.ekf.x_hat.flatten()
+            d_est = self.ekf.d.flatten()
+        else:
+            x_true = np.array(x_current)
+            d_est = np.zeros(3)
 
         # 2. KLUCZOWE: Obliczenie stanu NOMINALNEGO dla MPC
         # Odejmujemy bias od prędkości, żeby MPC nie naliczył go podwójnie!
@@ -212,6 +224,15 @@ class PathFollowingMPC:
             X_sol = sol.value(self.X)
             self.last_sol_U = U_sol
             self.last_sol_X = X_sol
+            
+            # Zapisz numeryczne wartości kosztów dla tego kroku
+            self.c_lat_hist.append(float(sol.value(self.cost_lat_expr)))
+            self.c_lon_hist.append(float(sol.value(self.cost_lon_expr)))
+            self.c_vtheta_hist.append(float(sol.value(self.cost_vtheta_expr)))
+            self.c_speed_hist.append(float(sol.value(self.cost_speed_expr)))
+            self.c_dv_hist.append(float(sol.value(self.cost_dV_expr)))
+            self.c_dalpha_hist.append(float(sol.value(self.cost_dAlpha_expr)))
+            
         except Exception as e:
             if self.last_sol_U is not None:
                 U_sol = np.roll(self.last_sol_U, -1, axis=1); U_sol[:, -1] = U_sol[:, -2]  
@@ -224,5 +245,6 @@ class PathFollowingMPC:
         V_cmd = float(U_sol[0, 0])
         alpha_cmd_deg = float(np.degrees(U_sol[1, 0]))
 
-        self.ekf.predict([V_cmd, float(U_sol[1, 0])])
+        if self.use_ekf:
+            self.ekf.predict([V_cmd, float(U_sol[1, 0])])
         return V_cmd, alpha_cmd_deg

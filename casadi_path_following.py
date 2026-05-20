@@ -16,8 +16,10 @@ Sterowanie:
 
 import sys
 import math
+from collections import deque
 import numpy as np
 import pygame
+import matplotlib.pyplot as plt
 
 sys.path.insert(0, ".")
 # Zmiana: importujemy nową klasę PathFollowingMPC
@@ -30,6 +32,19 @@ SCREEN_W, SCREEN_H = 1280, 800
 WORLD_W, WORLD_H = 200.0, 150.0
 FPS = 30
 SIM_DT = boat_model.DT  # musi = mpc.dt
+
+# Szum pomiarowy (odchylenie standardowe)
+# Klasa: Xsens MTi-670G (GNSS/INS, u-blox ZED-F9)
+# Stan: [x, y, psi, u, v, r]
+MEAS_NOISE_STD = np.array([
+    0.8,                        # x   — GNSS <1 m CEP → ~0.8 m 1σ
+    0.8,                        # y   — GNSS <1 m CEP → ~0.8 m 1σ
+    np.radians(0.8),            # psi — heading ±0.8° RMS (datasheet)
+    0.05,                       # u   — velocity 0.05 m/s RMS (datasheet)
+    0.05,                       # v   — velocity 0.05 m/s RMS (datasheet)
+    np.radians(0.1),            # r   — gyro 0.007°/s/√Hz → ~0.1°/s @200Hz
+])
+MEAS_FILTER_N = 5  # liczba próbek w filtrze średniej kroczącej
 
 # Kolory
 C_BG = (15, 20, 35)
@@ -130,6 +145,9 @@ class SimState:
 
         # MPC
         self.mpc = MPC()
+
+        # Filtr pomiarowy (bufor średniej kroczącej)
+        self.meas_buffer = deque(maxlen=MEAS_FILTER_N)
 
 
 # ==================== RYSOWANIE ====================
@@ -351,13 +369,18 @@ def simulation_step(state):
         return
 
     # Timeout safety — max 500 kroków
-    if state.step > 1500:
+    if state.step > 2000:
         print(f"[SIM] Timeout! step={state.step}, speed={speed:.2f}")
         state.path_done = True
         return
     
+    # 2. Pomiar z szumem + filtr średniej kroczącej
+    x_raw = state.x + np.random.randn(6) * MEAS_NOISE_STD
+    state.meas_buffer.append(x_raw)
+    x_filt = np.mean(state.meas_buffer, axis=0)
+
     try:
-        V_cmd, alpha_cmd_deg = mpc.compute_control(state.x, state.alpha, state.w)
+        V_cmd, alpha_cmd_deg = mpc.compute_control(x_filt, state.alpha, state.w)
     except Exception as e:
         print(f"[BŁĄD] compute_control NMPC: {e}")
         return
@@ -528,6 +551,138 @@ def main():
                               True, (80, 220, 100))
             screen.blit(msg, (SCREEN_W // 2 - msg.get_width() // 2,
                               SCREEN_H // 2 - 20))
+            if not getattr(state, 'plotted', False):
+                state.plotted = True
+                
+                mpc = state.mpc
+
+                # ── NRMSE – wskaźnik jakości podążania za ścieżką ──
+                from scipy.optimize import minimize_scalar
+
+                trail_arr = np.array(state.trail)  # (N, 2)
+                N_trail = len(trail_arr)
+
+                # Dla każdego punktu śladu znajdź najbliższy punkt na splajnie
+                # WAŻNE: szukamy monotonicznie wzdłuż ścieżki (okno przesuwne),
+                # żeby nie przeskakiwać na inne segmenty przy pętlach/skrzyżowaniach
+                ref_points = np.zeros_like(trail_arr)
+                s_values = np.zeros(N_trail)
+                s_window = mpc.s_max * 0.15  # okno przeszukiwania ±15% długości
+                s_prev = 0.0
+
+                for i in range(N_trail):
+                    bx, by = trail_arr[i]
+
+                    def dist2(s):
+                        px = float(mpc.spline_x(s))
+                        py = float(mpc.spline_y(s))
+                        return (bx - px) ** 2 + (by - py) ** 2
+
+                    # Szukaj tylko w okolicy poprzedniego s (monotoniczny postęp)
+                    s_lo = max(0.0, s_prev - s_window * 0.1)  # mały margines wstecz
+                    s_hi = min(mpc.s_max, s_prev + s_window)
+                    res = minimize_scalar(dist2, bounds=(s_lo, s_hi),
+                                          method='bounded')
+                    s_prev = res.x  # następny punkt szukaj od tego miejsca
+                    s_values[i] = res.x
+                    ref_points[i, 0] = float(mpc.spline_x(res.x))
+                    ref_points[i, 1] = float(mpc.spline_y(res.x))
+
+                # Odetnij „ogon" hamowania — tylko aktywna faza śledzenia
+                # Znajdź pierwszy moment, gdy s dotarło blisko końca ścieżki
+                s_threshold = 0.98 * mpc.s_max
+                end_indices = np.where(s_values >= s_threshold)[0]
+                if len(end_indices) > 0:
+                    cut_idx = end_indices[0] + 1  # włącznie z momentem dotarcia
+                else:
+                    cut_idx = N_trail  # nigdy nie dotarł — bierz wszystko
+
+                trail_active = trail_arr[:cut_idx]
+                ref_active = ref_points[:cut_idx]
+
+                print(f"\n[NRMSE] Aktywna faza śledzenia: "
+                      f"{cut_idx}/{N_trail} kroków "
+                      f"(odcięto {N_trail - cut_idx} kroków hamowania)")
+
+                # NRMSE osobno dla x, y i łącznie (pozycja 2D)
+                def nrmse(y_true, y_pred):
+                    num = np.linalg.norm(y_true - y_pred)
+                    den = np.linalg.norm(y_true - np.mean(y_true))
+                    return (1.0 - num / den) if den > 0 else -np.inf
+
+                nrmse_x = nrmse(ref_active[:, 0], trail_active[:, 0])
+                nrmse_y = nrmse(ref_active[:, 1], trail_active[:, 1])
+                nrmse_pos = nrmse(ref_active.flatten(), trail_active.flatten())
+
+                # Błąd cross-track (na aktywnej fazie)
+                cross_track = np.linalg.norm(trail_active - ref_active, axis=1)
+                ct_mean = np.mean(cross_track)
+                ct_max = np.max(cross_track)
+
+                print("\n" + "=" * 55)
+                print("  WSKAŹNIKI JAKOŚCI PODĄŻANIA ZA ŚCIEŻKĄ")
+                print("=" * 55)
+                print(f"  NRMSE (x)        = {nrmse_x:.4f}  ({nrmse_x*100:.1f}%)")
+                print(f"  NRMSE (y)        = {nrmse_y:.4f}  ({nrmse_y*100:.1f}%)")
+                print(f"  NRMSE (pozycja)  = {nrmse_pos:.4f}  ({nrmse_pos*100:.1f}%)")
+                print("-" * 55)
+                print(f"  Cross-track śr.  = {ct_mean:.3f} m")
+                print(f"  Cross-track max  = {ct_max:.3f} m")
+                print(f"  Liczba kroków    = {state.step}")
+                print("=" * 55 + "\n")
+
+                # ── Wykresy ──
+                c_total = [
+                    lat + lon + vth + spd + dv + da 
+                    for lat, lon, vth, spd, dv, da in zip(
+                        mpc.c_lat_hist, mpc.c_lon_hist, 
+                        mpc.c_vtheta_hist, mpc.c_speed_hist, 
+                        mpc.c_dv_hist, mpc.c_dalpha_hist
+                    )
+                ]
+
+                fig, axes = plt.subplots(2, 1, figsize=(12, 10),
+                                         gridspec_kw={'height_ratios': [1.2, 1]})
+
+                # --- Wykres 1: Koszty MPC ---
+                ax1 = axes[0]
+                ax1.plot(mpc.c_lat_hist, label="Błąd poprzeczny (lat)")
+                ax1.plot(mpc.c_lon_hist, label="Błąd wzdłużny (lon)")
+                ax1.plot(mpc.c_vtheta_hist, label="Prędkość wirtualna (vtheta)")
+                ax1.plot(mpc.c_speed_hist, label="Prędkość fizyczna (speed)")
+                ax1.plot(mpc.c_dv_hist, label="Zmiana prędkości (dV)")
+                ax1.plot(mpc.c_dalpha_hist, label="Zmiana wychylenia (dAlpha)")
+                ax1.plot(c_total, label="SUMA KOSZTÓW", linewidth=2.5,
+                         color='black', linestyle='--')
+                ax1.set_xlabel("Krok symulacji")
+                ax1.set_ylabel("Wartość kosztu")
+                ax1.set_title("Historia poszczególnych komponentów funkcji kosztu MPC")
+                ax1.legend(fontsize=8)
+                ax1.grid(True)
+
+                # --- Wykres 2: Cross-track error + NRMSE ---
+                ax2 = axes[1]
+                ax2.plot(cross_track, color='crimson', linewidth=1.2,
+                         label="Cross-track error")
+                ax2.axhline(ct_mean, color='orange', linestyle='--',
+                            label=f"Średni = {ct_mean:.3f} m")
+                ax2.axhline(ct_max, color='red', linestyle=':',
+                            label=f"Max = {ct_max:.3f} m")
+                ax2.set_xlabel("Krok symulacji")
+                ax2.set_ylabel("Odległość od ścieżki [m]")
+                ax2.set_title(
+                    f"Błąd cross-track  |  "
+                    f"NRMSE(pos) = {nrmse_pos*100:.1f}%  "
+                    f"NRMSE(x) = {nrmse_x*100:.1f}%  "
+                    f"NRMSE(y) = {nrmse_y*100:.1f}%"
+                )
+                ax2.legend()
+                ax2.grid(True)
+
+                fig.suptitle("Analiza jakości NMPC Path Following",
+                             fontsize=14, fontweight='bold')
+                plt.tight_layout()
+                plt.show(block=True)
 
         pygame.display.flip()
 
