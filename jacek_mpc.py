@@ -1,3 +1,19 @@
+import os
+import ctypes
+
+os.environ["ACADOS_SOURCE_DIR"] = "/home/jacek/Documents/acados"
+
+# Pre-load shared libraries to avoid libqpOASES_e.so loading issues
+acados_lib_dir = os.path.join(os.environ["ACADOS_SOURCE_DIR"], "lib")
+if os.path.exists(acados_lib_dir):
+    try:
+        ctypes.CDLL(os.path.join(acados_lib_dir, "libblasfeo.so"), mode=ctypes.RTLD_GLOBAL)
+        ctypes.CDLL(os.path.join(acados_lib_dir, "libhpipm.so"), mode=ctypes.RTLD_GLOBAL)
+        ctypes.CDLL(os.path.join(acados_lib_dir, "libqpOASES_e.so"), mode=ctypes.RTLD_GLOBAL)
+        ctypes.CDLL(os.path.join(acados_lib_dir, "libacados.so"), mode=ctypes.RTLD_GLOBAL)
+    except Exception as e:
+        print(f"Warning: Could not pre-load acados shared libraries: {e}")
+
 from acados_template import AcadosOcp, AcadosOcpSolver, plot_trajectories
 from boat_model import export_boat_model
 import numpy as np
@@ -10,15 +26,25 @@ class NMPC:
         self.N = 60
         self.DT = 0.2
         # wagi kosztów
-        Q_mat = np.diag([100.0, 100.0, 50.0, 25.0, 0.0, 0.0, 0.0, 0.0])
-        R_mat = np.diag([5.0, 100.0])
+        Q_mat = np.diag([11.1111, 11.1111, 14.5903, 5.0000, 0.0, 0.0, 0.0, 0.0])
+        R_mat = np.diag([0.0017, 1.6211])
+        # Q_ter = np.array([
+        #     [   95.0829,    -0.3614,    -3.6983,    62.4492,     1.7827,    -1.8355,     0.8665,     1.3056],
+        #     [   -0.3614,   159.7803,   846.0456,    -0.5224,   -95.3072,   239.0358,     0.0156,  -100.7342],
+        #     [   -3.6983,   846.0456,  6514.9493,    -5.3837, -1359.5118,  2212.7167,     0.1444, -1078.3125],
+        #     [   62.4492,    -0.5224,    -5.3837,    62.8581,     2.7450,    -2.7562,     1.0800,     2.0194],
+        #     [    1.7827,   -95.3072, -1359.5118,     2.7450,   985.5476,  -863.0928,    -0.0530,   716.4743],
+        #     [   -1.8355,   239.0358,  2212.7167,    -2.7562,  -863.0928,   981.9520,     0.0622,  -645.8128],
+        #     [    0.8665,     0.0156,     0.1444,     1.0800,    -0.0530,     0.0622,     0.0251,    -0.0396],
+        #     [    1.3056,  -100.7342, -1078.3125,     2.0194,   716.4743,  -645.8128,    -0.0396,   548.6710],
+        # ])
 
         # zmienne dla wyznaczenia sciezki
         self.ghost_extension = 20.0 # <--- DODANE (zabezpieczenie przed błędem w splajnie)
         self.last_theta_0 = 0.0 
         self.s_max = 0.0
         self.s_max_extended = 0.0
-        self.v_ref = 5.0 # należly sprawdzić lub ocenić jak szybko łódź ma płynąć
+        self.v_ref = 4.0 # należly sprawdzić lub ocenić jak szybko łódź ma płynąć
         self.a_ref = 0.5 # należy sprawdzić lub ocenić jak szybko łódź przyśpiesza
         # wartości a_ref i v_ref można przyjąć jako mniejsze niż są w rzeczywistości i łódź będzie płynąć
         # właśnie z taką zadaną prędkością i przyśpieszeniem
@@ -50,7 +76,7 @@ class NMPC:
         self.ocp.cost.cost_type_e = 'NONLINEAR_LS'
         self.ocp.cost.yref_e = np.zeros((nx,))
         self.ocp.model.cost_y_expr_e = model.x
-        self.ocp.cost.W_e = Q_mat
+        self.ocp.cost.W_e = 5*Q_mat
 
         # ograniczenia
         self.ocp.constraints.lbu = np.array([-5.0, -np.pi/4])
@@ -65,15 +91,32 @@ class NMPC:
         # PARTIAL_CONDENSING_HPIPM, FULL_CONDENSING_QPOASES, FULL_CONDENSING_HPIPM,
         # PARTIAL_CONDENSING_QPDUNES, PARTIAL_CONDENSING_OSQP, FULL_CONDENSING_DAQP
         self.ocp.solver_options.hessian_approx = 'GAUSS_NEWTON' # 'GAUSS_NEWTON', 'EXACT'
-        self.ocp.solver_options.integrator_type = 'IRK'
+        self.ocp.solver_options.integrator_type = 'ERK'
         # ocp.solver_options.print_level = 1
-        self.ocp.solver_options.nlp_solver_type = 'SQP' # SQP_RTI, SQP
+        self.ocp.solver_options.nlp_solver_type = 'SQP_RTI' # SQP_RTI, SQP
         self.ocp.solver_options.globalization = 'MERIT_BACKTRACKING' # turns on globalization
-
+        self.ocp.constraints.x0 = np.zeros(nx)
+        
         self.ocp_solver = AcadosOcpSolver(self.ocp) # <--- POPRAWKA (brakowało self.)
 
         self.simX = np.zeros((self.N+1, nx))
         self.simU = np.zeros((self.N, nu))
+
+        class DummyEKF:
+            def __init__(self):
+                self.x_hat_kk = np.zeros((6, 1))
+                self.P_kk = np.eye(6)
+        self.ekf = DummyEKF()
+
+        self.predicted_path = None
+        self.last_sol_X = np.zeros((9, 2))
+        
+        self.c_lat_hist = []
+        self.c_lon_hist = []
+        self.c_vtheta_hist = []
+        self.c_speed_hist = []
+        self.c_dv_hist = []
+        self.c_dalpha_hist = []
 
     def set_path(self, waypoints: np.ndarray) -> float:
         # 1. Przedłużenie ścieżki (ghost point) - niezbędne dla zachowania kształtu
@@ -156,6 +199,9 @@ class NMPC:
         #sprawdzenie czy sciezka istnieje
         if self.spline_x is None:
             raise RuntimeError("Najpierw wywołaj set_path(waypoints)!")
+        
+        # Aktualizacja EKF dummy
+        self.ekf.x_hat_kk = x_current[0:6].reshape(6, 1)
 
         x0_acados = np.concatenate([x_current[0:6], [current_w, current_alpha]])
         self.ocp_solver.set(0, "lbx", x0_acados)
@@ -171,12 +217,13 @@ class NMPC:
         for idx in range(self.N):
             current_v += self.a_ref * self.DT
             
-            dist_to_end = max(0.0, self.s_max_extended - current_theta)
-            v_stop = min(self.v_ref, 0.2 * dist_to_end)
+            dist_to_end = max(0.0, self.s_max_original - current_theta)
+            # Zamiast liniowego 0.1, użyj pierwiastka (proporcjonalnego do energii kinetycznej)
+            v_stop = min(self.v_ref, 0.4 * np.sqrt(max(0.0, dist_to_end)))
             
             next_v = min(current_v, v_stop)
             current_v = next_v 
-            
+            print(current_v)
             distance = next_v * self.DT
             x_target, y_target, current_theta = self.get_next_step(current_theta, distance)
             psi_ref = self._get_heading_ref(current_theta)
@@ -191,9 +238,41 @@ class NMPC:
         
         status = self.ocp_solver.solve()
 
+        solve_time = self.ocp_solver.get_stats("time_tot") # Zwraca czas w sekundach
+        print(f"Czas obliczeń OCP: {solve_time * 1000:.2f} ms")
+
         if status != 0:
             print(f"[Ostrzeżenie] Solver zwrócił status {status}!")
 
         u_opt = self.ocp_solver.get(0, "u")
 
-        return u_opt[0], u_opt[1]
+        # Zapisz prognozę drogi dla symulatora
+        predicted = np.zeros((self.N, 2))
+        for k in range(self.N):
+            xk = self.ocp_solver.get(k, "x")
+            predicted[k, :] = xk[0:2]
+        self.predicted_path = predicted
+
+        # Zapisz wirtualny postęp dla kompatybilności
+        self.last_sol_X = np.zeros((9, 2))
+        self.last_sol_X[8, 1] = self.last_theta_0
+
+        # Wylicz koszty pod wykresy
+        path_x = float(self.spline_x(self.last_theta_0))
+        path_y = float(self.spline_y(self.last_theta_0))
+        err_x = path_x - x_current[0]
+        err_y = path_y - x_current[1]
+        psi = x_current[2]
+        
+        ego_x = np.cos(psi) * err_x + np.sin(psi) * err_y
+        ego_y = -np.sin(psi) * err_x + np.cos(psi) * err_y
+
+        self.c_lat_hist.append(float(100.0 * ego_y**2))
+        self.c_lon_hist.append(float(100.0 * ego_x**2))
+        self.c_vtheta_hist.append(0.0)
+        self.c_speed_hist.append(float(25.0 * (x_current[3] - 5.0)**2))
+        self.c_dv_hist.append(0.0)
+        self.c_dalpha_hist.append(0.0)
+
+        # alpha cmd musi być w stopniach dla casadi_path_following
+        return u_opt[0], np.degrees(u_opt[1])
