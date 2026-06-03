@@ -16,6 +16,7 @@ if os.path.exists(acados_lib_dir):
 
 from acados_template import AcadosOcp, AcadosOcpSolver, plot_trajectories
 from boat_model import export_boat_model
+from MHE import MHE
 import numpy as np
 import casadi as ca
 
@@ -101,6 +102,9 @@ class NMPC:
 
         self.simX = np.zeros((self.N+1, nx))
         self.simU = np.zeros((self.N, nu))
+
+        # estymator MHE
+        self.mhe = MHE(self.DT, self.N)
 
         class DummyEKF:
             def __init__(self):
@@ -223,7 +227,6 @@ class NMPC:
             
             next_v = min(current_v, v_stop)
             current_v = next_v 
-            print(current_v)
             distance = next_v * self.DT
             x_target, y_target, current_theta = self.get_next_step(current_theta, distance)
             psi_ref = self._get_heading_ref(current_theta)
@@ -274,5 +277,7 @@ class NMPC:
         self.c_dv_hist.append(0.0)
         self.c_dalpha_hist.append(0.0)
 
+        self.mhe.set_measurements(x_current, np.array([[u_opt[0], u_opt[1]]]))
+        self.mhe.predict_x
         # alpha cmd musi być w stopniach dla casadi_path_following
         return u_opt[0], np.degrees(u_opt[1])
