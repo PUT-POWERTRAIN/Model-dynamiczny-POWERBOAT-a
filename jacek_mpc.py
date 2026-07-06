@@ -16,7 +16,6 @@ if os.path.exists(acados_lib_dir):
 
 from acados_template import AcadosOcp, AcadosOcpSolver, plot_trajectories
 from boat_model import export_boat_model
-from MHE import MHE
 import numpy as np
 import casadi as ca
 
@@ -28,7 +27,7 @@ class NMPC:
         self.DT = 0.2
         # wagi kosztów
         Q_mat = np.diag([11.1111, 11.1111, 14.5903, 5.0000, 0.0, 0.0, 0.0, 0.0])
-        R_mat = np.diag([0.0017, 1.6211])
+        R_mat = np.diag([0.1017, 3.6211])
         # Q_ter = np.array([
         #     [   95.0829,    -0.3614,    -3.6983,    62.4492,     1.7827,    -1.8355,     0.8665,     1.3056],
         #     [   -0.3614,   159.7803,   846.0456,    -0.5224,   -95.3072,   239.0358,     0.0156,  -100.7342],
@@ -45,7 +44,7 @@ class NMPC:
         self.last_theta_0 = 0.0 
         self.s_max = 0.0
         self.s_max_extended = 0.0
-        self.v_ref = 4.0 # należly sprawdzić lub ocenić jak szybko łódź ma płynąć
+        self.v_ref = 2.0 # należly sprawdzić lub ocenić jak szybko łódź ma płynąć
         self.a_ref = 0.5 # należy sprawdzić lub ocenić jak szybko łódź przyśpiesza
         # wartości a_ref i v_ref można przyjąć jako mniejsze niż są w rzeczywistości i łódź będzie płynąć
         # właśnie z taką zadaną prędkością i przyśpieszeniem
@@ -102,15 +101,6 @@ class NMPC:
 
         self.simX = np.zeros((self.N+1, nx))
         self.simU = np.zeros((self.N, nu))
-
-        # estymator MHE
-        self.mhe = MHE(self.DT, self.N)
-
-        class DummyEKF:
-            def __init__(self):
-                self.x_hat_kk = np.zeros((6, 1))
-                self.P_kk = np.eye(6)
-        self.ekf = DummyEKF()
 
         self.predicted_path = None
         self.last_sol_X = np.zeros((9, 2))
@@ -204,26 +194,23 @@ class NMPC:
         if self.spline_x is None:
             raise RuntimeError("Najpierw wywołaj set_path(waypoints)!")
         
-        # Aktualizacja EKF dummy
-        self.ekf.x_hat_kk = x_current[0:6].reshape(6, 1)
-
-        x0_acados = np.concatenate([x_current[0:6], [current_w, current_alpha]])
+        x0_acados = np.concatenate([np.array(x_current).flatten(), [current_w, current_alpha]])
         self.ocp_solver.set(0, "lbx", x0_acados)
         self.ocp_solver.set(0, "ubx", x0_acados)
 
         ## pytanie czy nie warto dodać tutaj sprawdzenia gdzie jesteśmy na tej ścieżce faktycznie, żeby w czasie
         ## się to nie rozjechało bardzo
-        self.last_theta_0 = self._find_closest_theta(x_current[0], x_current[1], self.last_theta_0)
+        self.last_theta_0 = self._find_closest_theta(x0_acados[0], x0_acados[1], self.last_theta_0)
 
         current_theta = self.last_theta_0
-        current_v = x_current[3] 
+        current_v = x0_acados[3] 
 
         for idx in range(self.N):
             current_v += self.a_ref * self.DT
             
             dist_to_end = max(0.0, self.s_max_original - current_theta)
             # Zamiast liniowego 0.1, użyj pierwiastka (proporcjonalnego do energii kinetycznej)
-            v_stop = min(self.v_ref, 0.4 * np.sqrt(max(0.0, dist_to_end)))
+            v_stop = min(self.v_ref, 0.5 * np.sqrt(max(0.0, dist_to_end)))
             
             next_v = min(current_v, v_stop)
             current_v = next_v 
@@ -263,9 +250,9 @@ class NMPC:
         # Wylicz koszty pod wykresy
         path_x = float(self.spline_x(self.last_theta_0))
         path_y = float(self.spline_y(self.last_theta_0))
-        err_x = path_x - x_current[0]
-        err_y = path_y - x_current[1]
-        psi = x_current[2]
+        err_x = path_x - x0_acados[0]
+        err_y = path_y - x0_acados[1]
+        psi = x0_acados[2]
         
         ego_x = np.cos(psi) * err_x + np.sin(psi) * err_y
         ego_y = -np.sin(psi) * err_x + np.cos(psi) * err_y
@@ -273,11 +260,9 @@ class NMPC:
         self.c_lat_hist.append(float(100.0 * ego_y**2))
         self.c_lon_hist.append(float(100.0 * ego_x**2))
         self.c_vtheta_hist.append(0.0)
-        self.c_speed_hist.append(float(25.0 * (x_current[3] - 5.0)**2))
+        self.c_speed_hist.append(float(25.0 * (x0_acados[3] - 5.0)**2))
         self.c_dv_hist.append(0.0)
         self.c_dalpha_hist.append(0.0)
 
-        self.mhe.set_measurements(x_current, np.array([[u_opt[0], u_opt[1]]]))
-        self.mhe.predict_x
         # alpha cmd musi być w stopniach dla casadi_path_following
         return u_opt[0], np.degrees(u_opt[1])
